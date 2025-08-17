@@ -1,0 +1,110 @@
+[
+  {
+    "model": "core.aboutsection",
+    "pk": 1,
+    "fields": {
+      "slug": "mission",
+      "title": "Notre mission",
+      "content": "GreenCart révolutionne la consommation alimentaire en connectant consommateurs conscients et producteurs locaux pour un avenir plus durable."
+    }
+  },
+  {
+    "model": "core.aboutsection",
+    "pk": 2,
+    "fields": {
+      "slug": "histoire",
+      "title": "Notre histoire",
+      "content": "Tout a commencé quand Lucie, ingénieure agroalimentaire, a découvert l'ampleur du gaspillage alimentaire. GreenCart est née en 2023 pour soutenir les producteurs locaux."
+    }
+  },
+  {
+    "model": "core.aboutsection",
+    "pk": 3,
+    "fields": {
+      "slug": "engagement2025",
+      "title": "Notre engagement 2025",
+      "content": "2 000 tonnes sauvées, 1 000 producteurs partenaires, 50 000 familles sensibilisées d'ici fin 2025."
+    }
+  },
+  {
+    "model": "core.corevalue",
+    "pk": 1,
+    "fields": {
+      "title": "Écologique",
+      "description": "Réduction du gaspillage alimentaire et préservation de l'environnement",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.corevalue",
+    "pk": 2,
+    "fields": {
+      "title": "Solidaire",
+      "description": "Soutien aux producteurs locaux et création de liens communautaires",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.corevalue",
+    "pk": 3,
+    "fields": {
+      "title": "Éthique",
+      "description": "Commerce équitable et transparence dans toutes nos actions",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.corevalue",
+    "pk": 4,
+    "fields": {
+      "title": "Qualité",
+      "description": "Sélection rigoureuse de produits frais et authentiques",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.impactstat",
+    "pk": 1,
+    "fields": {
+      "label": "Tonnes sauvées",
+      "value": "1,200+",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.impactstat",
+    "pk": 2,
+    "fields": {
+      "label": "Producteurs partenaires",
+      "value": "500+",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.impactstat",
+    "pk": 3,
+    "fields": {
+      "label": "Clients satisfaits",
+      "value": "25,000+",
+      "icon": ""
+    }
+  },
+  {
+    "model": "core.impactstat",
+    "pk": 4,
+    "fields": {
+      "label": "Taux de satisfaction",
+      "value": "95%",
+      "icon": ""
+    }
+  },
+	{
+	  "model": "core.legalinformation",
+	  "pk": 1,
+	  "fields": {
+		"title": "Mentions Légales",
+		"content": "GreenCart SAS - 8 Rue de la République, 69001 Lyon - RCS Lyon B...",
+		"last_updated": "2025-06-27"
+	  }
+	}
+]

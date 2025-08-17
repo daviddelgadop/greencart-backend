@@ -1,0 +1,19 @@
+# Node.js (frontend)
+node_modules/
+greencart-frontend/node_modules/
+dist/
+build/
+
+# Python / Django (backend)
+*.pyc
+__pycache__/
+db.sqlite3
+media/
+staticfiles/
+env/
+.env
+
+# VSCode config
+.vscode/
+
+backup/
