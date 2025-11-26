@@ -26,14 +26,15 @@ def validate_file_extension(value):
 # === Modèles abstraits communs ===
 
 class BaseModel(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
     deactivated_at = models.DateTimeField(null=True, blank=True) 
     is_active = models.BooleanField(default=True)
 
     class Meta:
         abstract = True
-
+        ordering = ("-created_at",)
+        
 
 # === Gestion des utilisateurs personnalisés ===
 
@@ -76,6 +77,7 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     updated_at = models.DateTimeField(auto_now=True)
     deletion_requested = models.BooleanField(default=False)
     deletion_requested_at = models.DateTimeField(null=True, blank=True)
+
 
     avg_rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
     ratings_count = models.PositiveIntegerField(default=0)
@@ -336,7 +338,7 @@ class ProductBundle(BaseModel):
     discounted_percentage = models.PositiveIntegerField(default=0)
     discounted_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     original_price = models.DecimalField(max_digits=10, decimal_places=2)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, db_index=True, default='published')
     total_avoided_waste_kg = models.DecimalField(max_digits=7, decimal_places=2, default=0)
     total_avoided_co2_kg = models.DecimalField(max_digits=7, decimal_places=2, default=0)
     sold_bundles = models.PositiveIntegerField(default=0)
@@ -370,13 +372,13 @@ class ProductBundle(BaseModel):
     def calculate_original_price(self):
         return sum(item.product.original_price * item.quantity for item in self.items.all())
 
-    def save(self, *args, **kwargs):
-        is_new = self._state.adding
-        if self.stock == 0 and self.status == 'published':
-            self.status = 'out_of_stock'
+    #def save(self, *args, **kwargs):
+    #    is_new = self._state.adding
+    #    if self.stock == 0 and self.status == 'published':
+    #        self.status = 'out_of_stock'
 
         #super().save(update_fields=["original_price", "discounted_price", "status"])
-        super().save(*args, **kwargs)
+    #    super().save(*args, **kwargs)
 
     def calculate_bundle_impact(self):
         total_waste = Decimal("0.0")
@@ -420,6 +422,10 @@ class ProductBundle(BaseModel):
     def __str__(self):
         return self.title
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "is_active"]),
+        ]
 
 class ProductBundleItem(BaseModel):
     bundle = models.ForeignKey(ProductBundle, on_delete=models.CASCADE, related_name="items")

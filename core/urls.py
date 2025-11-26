@@ -3,11 +3,14 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from django.conf import settings
 from django.conf.urls.static import static
-from .views import CreatePayPalOrderView
 
 from .views import (
-    CustomTokenObtainPairView,
-    RegisterUserView,
+    AdminUsersView,
+    AdminDeletionRequestedCustomersView,
+    AdminUserUpdateView,
+    AdminUserDeactivateView,
+    AdminUserActivateView,
+    AdminUserHardDeleteView,
     MeView,
     UserDetailViewSet,
     VerifyPasswordView,
@@ -40,18 +43,15 @@ from .views import (
     AdminBlogPostViewSet,
     PublicBlogPostViewSet,
     PublicBlogPostListView,
+    RecommendationsView,
+    PublicBundlesView,
+
     AboutSectionViewSet,
     CoreValueViewSet,
     LegalInformationViewSet,
 )
 
 from .general_analytics_views import ProducerAnalyticsView, ProducerAIPreviewView
-
-from .analytics_reviews import (
-    EvaluationsDeepView,
-    ReviewsKeywordsView,
-    SalesVsRatingsView,
-)
 
 from .analytics_endpoints import (
     SalesTimeseriesView,
@@ -65,6 +65,9 @@ from .analytics_endpoints import (
     PaymentsDeepView,
     CohortsMonthlyView,
     GeoDeepView,
+    EvaluationsDeepView,
+    ReviewsKeywordsView,
+    SalesVsRatingsView,
 )
 
 from .analytics_cross import (
@@ -84,7 +87,19 @@ from .analytics_cross import (
     InventoryEfficiencyView,
 )
 
+from .auth_views import (
+    CustomTokenObtainPairView,
+    RegisterUserView,
+    VerifyEmailView,
+    ResendVerificationEmailView,
+    PasswordResetRequestView,
+    PasswordResetConfirmView,
+    ChangePasswordView,
+)
+
+
 router = DefaultRouter()
+
 router.register(r'users', UserDetailViewSet, basename='user')
 router.register(r'addresses', AddressViewSet, basename='address')
 router.register(r'companies', CompanyViewSet, basename='company')
@@ -113,16 +128,33 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include(router.urls)),
 
+    path("api/recommendations/", RecommendationsView.as_view(), name="recommendations"),
+
+
     # Auth
-    path('api/auth/register/', RegisterUserView.as_view(), name='register'),
-    path('api/auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/verify-password/', VerifyPasswordView.as_view(), name='verify-password'),
     path('api/me/', MeView.as_view(), name='me'),
+
+    path('api/admin/users/', AdminUsersView.as_view(), name='admin-users'),
+    path('api/admin/users/deletion-requests/', AdminDeletionRequestedCustomersView.as_view(), name='admin-users-deletion-requests'),
+    path('api/admin/users/<int:pk>/', AdminUserUpdateView.as_view(), name='admin-users-update'),
+    path('api/admin/users/<int:pk>/deactivate/', AdminUserDeactivateView.as_view(), name='admin-users-deactivate'),
+    path('api/admin/users/<int:pk>/activate/', AdminUserActivateView.as_view(), name='admin-users-activate'),
+    path("api/admin/users/<int:pk>/hard-delete/", AdminUserHardDeleteView.as_view(), name="admin-user-hard-delete"),
+
+    path('api/auth/register/', RegisterUserView.as_view(), name='register'),
+    path('api/auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('api/auth/verify-email/', VerifyEmailView.as_view(), name='verify-email'),
+    path('api/auth/resend-verification/', ResendVerificationEmailView.as_view(), name='resend-verification'),
+    path('api/auth/password-reset/', PasswordResetRequestView.as_view(), name='password-reset'),
+    path('api/auth/password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
+    path('api/auth/change-password/', ChangePasswordView.as_view(), name='change-password'),
 
     path('api/postal-codes/', PostalCodesListAPIView.as_view()),
     path('api/postal-codes/<str:code_postal>/', PostalInfoAPIView.as_view()),
     path('api/public-bundles/<int:id>/', PublicProductBundleDetailView.as_view()),
     path('api/public-bundles/', PublicProductBundleListView.as_view()),
+    #path("api/public-bundles/", PublicBundlesView.as_view(), name="public-bundles"),
     path('api/download-user-data/', DownloadUserDataView.as_view(), name='download-user-data'),
     path('account-deletion-request/', AccountDeletionRequestView.as_view(), name='account-deletion-request'),
     path('api/user-settings/', UserSettingView.as_view(), name='user-settings'),

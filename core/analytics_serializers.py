@@ -387,16 +387,19 @@ class SalesOrderRowSerializer(serializers.ModelSerializer):
         return self.get_producer_names(obj)
     
 
+
 class OrderItemDeepSerializer(serializers.ModelSerializer):
     unit_price = serializers.SerializerMethodField()
     producer_ids = serializers.SerializerMethodField()
     producer_names = serializers.SerializerMethodField()
     company_names = serializers.SerializerMethodField()
+    item_id = serializers.IntegerField(source="id", read_only=True)
 
     class Meta:
         model = OrderItem
         fields = (
-            "id",
+            "id",   
+            "item_id", 
             "quantity",
             "total_price",
             "unit_price",
@@ -416,67 +419,73 @@ class OrderItemDeepSerializer(serializers.ModelSerializer):
         except Exception:
             return 0.0
 
-    def _snapshot(self, obj: OrderItem) -> dict:
-        snap = getattr(obj, "bundle_snapshot", None)
-        return snap if isinstance(snap, dict) else {}
-
-    def _producer_id_name(self, obj: OrderItem):
-        snap = self._snapshot(obj)
-        pid = snap.get("producer_id")
-        pname = snap.get("producer_name")
-        if pid is not None or pname is not None:
-            return pid, pname
+    # --- Alive relations (bundle -> items -> product -> company -> owner) ---
+    def _bundle_producers_and_companies(self, obj: OrderItem):
+        ids, owner_names, company_names, seen = [], [], [], set()
         b = getattr(obj, "bundle", None)
-        if b is not None:
-            pdata = getattr(b, "producer_data", None)
-            if isinstance(pdata, dict):
-                return pdata.get("id"), pdata.get("public_display_name")
-        return None, None
+        if not b:
+            return ids, owner_names, company_names
 
-    def _company_id_name(self, obj: OrderItem):
-        snap = self._snapshot(obj)
-        cid = snap.get("company_id")
-        cname = snap.get("company_name")
-        if cid is not None or cname is not None:
-            return cid, cname
-        prods = snap.get("products") or []
-        for p in prods:
-            pcid = p.get("company_id")
-            pcname = p.get("company_name")
-            if pcid is not None or pcname:
-                return pcid, pcname
-        b = getattr(obj, "bundle", None)
-        if b is not None:
-            cdata = getattr(b, "company_data", None)
-            if isinstance(cdata, dict) and cdata.get("name"):
-                return cdata.get("id"), cdata.get("name")
-            return getattr(b, "company_id", None), getattr(b, "company_name", None)
-        return None, None
+        items = getattr(b, "items", None)
+        iterable = items.all() if hasattr(items, "all") else (items or [])
+        for bi in iterable:
+            prod = getattr(bi, "product", None)
+            comp = getattr(prod, "company", None)
+            if not comp:
+                continue
 
-    def get_producer_ids(self, obj: OrderItem) -> list[int]:
-        pid, _ = self._producer_id_name(obj)
-        return [pid] if pid is not None else []
+            cid = getattr(comp, "id", None)
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            ids.append(cid)
 
-    def get_producer_names(self, obj: OrderItem) -> list[str]:
-        _, pname = self._producer_id_name(obj)
-        return [pname] if pname else []
+            # company name
+            company_names.append(getattr(comp, "name", None))
 
-    def get_company_names(self, obj: OrderItem) -> list[str]:
-        _, cname = self._company_id_name(obj)
-        return [cname] if cname else []
+            # owner display name
+            owner = getattr(comp, "owner", None)
+            display = (
+                getattr(owner, "public_display_name", None)
+                or " ".join(
+                    x for x in [
+                        (getattr(owner, "first_name", "") or "").strip(),
+                        (getattr(owner, "last_name", "") or "").strip(),
+                    ] if x
+                )
+                or getattr(owner, "username", None)
+                or getattr(owner, "email", None)
+            )
+            owner_names.append(display)
 
+        return ids, owner_names, company_names
+
+    def get_producer_ids(self, obj: OrderItem) -> List[int]:
+        pids, _, _ = self._bundle_producers_and_companies(obj)
+        return pids
+
+    def get_producer_names(self, obj: OrderItem) -> List[str]:
+        _, pnames, _ = self._bundle_producers_and_companies(obj)
+        return [n for n in pnames if n]
+
+    def get_company_names(self, obj: OrderItem) -> List[str]:
+        _, _, cnames = self._bundle_producers_and_companies(obj)
+        return [c for c in cnames if c]
 
 
 class OrderDeepSerializer(serializers.ModelSerializer):
     """
-    Rich order:
-    - items (each item can expose producer/company via its bundle_snapshot)
-    - payments (or fallback from payment_method_snapshot)
-    - addresses (real objects or snapshots)
-    - impact metrics
-    - aggregated producer/company fields at order level (deduped)
+    Rich order (sin usar snapshots para productor/empresa):
+    - items (cada item resuelve productor/empresa desde el bundle vivo)
+    - payments (o fallback desde payment_method_snapshot)
+    - addresses (objetos reales o snapshots)
+    - métricas de impacto
+    - campos agregados de productor/empresa a nivel pedido (deduplicados) construidos desde items
     """
+    user_name = serializers.SerializerMethodField()
+
     items = OrderItemDeepSerializer(many=True, read_only=True)
+
     payments = serializers.SerializerMethodField()
     shipping_address = serializers.SerializerMethodField()
     billing_address = serializers.SerializerMethodField()
@@ -488,16 +497,16 @@ class OrderDeepSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = (
-            "id", "created_at", "status",
+            "id", "order_code", "created_at", "status",
             "subtotal", "shipping_cost", "total_price",
             "order_total_avoided_waste_kg", "order_total_avoided_co2_kg", "order_total_savings",
             "items", "payments", "shipping_address", "billing_address",
             "producer_ids", "producer_names", "company_names",
+            "user_name",
         )
 
-    # ---- Payments ----
+    # -------------------- Payments --------------------
     def get_payments(self, obj):
-        # Try multiple related names
         pays = (
             getattr(obj, "payments", None)
             or getattr(obj, "payment_set", None)
@@ -522,7 +531,7 @@ class OrderDeepSerializer(serializers.ModelSerializer):
             })
         return out
 
-    # ---- Addresses ----
+    # -------------------- Addresses --------------------
     def get_shipping_address(self, obj):
         addr = getattr(obj, "shipping_address", None)
         if addr:
@@ -555,83 +564,55 @@ class OrderDeepSerializer(serializers.ModelSerializer):
             }
         return None
 
-    # ---- Producers/Companies aggregated from items ----
-    def _collect_item_snapshots(self, obj: Order) -> List[dict]:
-        snaps: List[dict] = []
+    # -------------------- Producers --------------------
+    def _iter_items(self, obj: Order):
         items = getattr(obj, "items", None)
-        if not items:
-            return snaps
-        for it in items.all() if hasattr(items, "all") else items:
-            snap = getattr(it, "bundle_snapshot", None)
-            if isinstance(snap, dict):
-                snaps.append(snap)
-        return snaps
-
-    def _aggregate_producers(self, obj: Order) -> Tuple[List[int], List[str]]:
-        """
-        Producers = snapshot.producer_id / snapshot.producer_name.
-        Fallback to companies from products[] only if producer fields are missing.
-        """
-        ids: List[int] = []
-        names: List[str] = []
-        seen = set()
-        for snap in self._collect_item_snapshots(obj):
-            pid = snap.get("producer_id")
-            pname = snap.get("producer_name")
-            if pid is not None:
-                if pid not in seen:
-                    seen.add(pid)
-                    ids.append(pid)
-                    names.append(pname)
-                continue
-            # fallback: treat companies from products[] as last resort
-            pids, pnames = _producers_from_snapshot(snap)
-            for cid, cname in zip(pids, pnames):
-                if cid in seen:
-                    continue
-                seen.add(cid)
-                ids.append(cid)
-                names.append(cname)
-        return ids, names
-
-    def _aggregate_companies(self, obj: Order) -> Tuple[List[int], List[str]]:
-        """
-        Companies = snapshot.company_id / snapshot.company_name.
-        Fallback to products[] company fields when missing.
-        """
-        ids: List[int] = []
-        names: List[str] = []
-        seen = set()
-        for snap in self._collect_item_snapshots(obj):
-            cid = snap.get("company_id")
-            cname = snap.get("company_name")
-            if cid is not None:
-                if cid not in seen:
-                    seen.add(cid)
-                    ids.append(cid)
-                    names.append(cname)
-                continue
-            pids, pnames = _producers_from_snapshot(snap)
-            for ccid, ccname in zip(pids, pnames):
-                if ccid in seen:
-                    continue
-                seen.add(ccid)
-                ids.append(ccid)
-                names.append(ccname)
-        return ids, names
+        return items.all() if hasattr(items, "all") else (items or [])
 
     def get_producer_ids(self, obj: Order) -> List[int]:
-        ids, _ = self._aggregate_producers(obj)
+        ids, seen = [], set()
+        for it in self._iter_items(obj):
+            pids = OrderItemDeepSerializer().get_producer_ids(it)
+            for pid in pids:
+                if pid is None or pid in seen:
+                    continue
+                seen.add(pid)
+                ids.append(pid)
         return ids
 
     def get_producer_names(self, obj: Order) -> List[str]:
-        _, names = self._aggregate_producers(obj)
+        names, seen = [], set()
+        for it in self._iter_items(obj):
+            pnames = OrderItemDeepSerializer().get_producer_names(it)
+            for n in pnames:
+                if not n or n in seen:
+                    continue
+                seen.add(n)
+                names.append(n)
         return names
 
     def get_company_names(self, obj: Order) -> List[str]:
-        _, names = self._aggregate_companies(obj)
+        names, seen = [], set()
+        for it in self._iter_items(obj):
+            cnames = OrderItemDeepSerializer().get_company_names(it)
+            for n in cnames:
+                if not n or n in seen:
+                    continue
+                seen.add(n)
+                names.append(n)
         return names
 
+    # -------------------- User display --------------------
+    def get_user_name(self, obj):
+        u = getattr(obj, "user", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "public_display_name", None)
+            or f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
 
 
@@ -691,23 +672,56 @@ class CartDeepSerializer(serializers.ModelSerializer):
         model = Cart
         fields = ("id", "user_id", "is_active", "updated_at", "cart_items")
 
+
 class CartsAbandonedBundleLightSerializer(serializers.Serializer):
     bundle_id = serializers.IntegerField(allow_null=True)
-    title = serializers.CharField(allow_null=True)
-    stock = serializers.IntegerField()
-    products = serializers.ListField(child=serializers.DictField(), allow_empty=True)
-    producer_ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=True)
-    producer_names = serializers.ListField(child=serializers.CharField(), allow_empty=True)
-    company_names = serializers.ListField(child=serializers.CharField(), allow_empty=True)
+    title = serializers.CharField(allow_null=True, required=False)
+    stock = serializers.IntegerField(required=False)
+    products = serializers.ListField(child=serializers.DictField(), required=False)
+    producer_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
+    producer_names = serializers.ListField(child=serializers.CharField(), required=False)
+    company_names = serializers.ListField(child=serializers.CharField(), required=False)
+
 
 class CartsAbandonedItemSerializer(serializers.Serializer):
     cart_item_id = serializers.IntegerField(allow_null=True)
     quantity = serializers.IntegerField()
+    unit_price = serializers.FloatField(required=False)  
+    line_total = serializers.FloatField(required=False)
     bundle = CartsAbandonedBundleLightSerializer(allow_null=True)
+
 
 class CartsAbandonedRowSerializer(serializers.Serializer):
     cart_id = serializers.IntegerField()
     user_id = serializers.IntegerField(allow_null=True)
+    user_name = serializers.CharField(allow_null=True, required=False)
     updated_at = serializers.DateTimeField(allow_null=True)
     items_qty = serializers.IntegerField()
+    amount = serializers.FloatField(required=False)   
     items = CartsAbandonedItemSerializer(many=True)
+
+
+class CartsAbandonedItemRowSerializer(serializers.Serializer):
+    cart_id = serializers.IntegerField()
+    user_id = serializers.IntegerField(allow_null=True)
+    user_name = serializers.CharField(allow_null=True, required=False)
+    updated_at = serializers.DateTimeField(allow_null=True)
+
+    cart_item_id = serializers.IntegerField(allow_null=True)
+    quantity = serializers.IntegerField()
+    unit_price = serializers.FloatField(required=False)
+    line_total = serializers.FloatField(required=False)
+    bundle = CartsAbandonedBundleLightSerializer(allow_null=True)
+
+
+class PaymentsDeepSerializer(serializers.Serializer):
+    order_id = serializers.IntegerField()
+    order_item_id = serializers.IntegerField(required=False, allow_null=True)
+    created_at = serializers.DateTimeField()
+    method = serializers.CharField()
+    status = serializers.CharField()
+    amount = serializers.FloatField()
+    producer_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
+    producer_names = serializers.ListField(child=serializers.CharField(), required=False)
+    company_names = serializers.ListField(child=serializers.CharField(), required=False)
+    user_name = serializers.CharField(source="user_name", required=False)

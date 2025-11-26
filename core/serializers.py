@@ -41,6 +41,10 @@ from decimal import Decimal
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import ObjectDoesNotExist
+from typing import Any, Dict, List, Optional
+from django.db.models import Prefetch
+from django.conf import settings
+
 
 
 class RateOnlySerializer(serializers.Serializer):
@@ -52,6 +56,7 @@ class RateOnlySerializer(serializers.Serializer):
 
 class CustomUserSerializer(serializers.ModelSerializer):
     avatar = serializers.ImageField(required=False, allow_null=True)
+    avatar_url = serializers.SerializerMethodField()
     main_address = serializers.PrimaryKeyRelatedField(
         queryset=Address.objects.all(),
         required=False,
@@ -69,24 +74,34 @@ class CustomUserSerializer(serializers.ModelSerializer):
             'type',
             'phone',
             'date_of_birth',
-            'avatar',
+            'avatar',         
+            'avatar_url',    
             'public_display_name',
             'main_address',
             'description_utilisateur',
             'years_of_experience',
             'is_staff',
+            'is_active',
+            'deletion_requested', 
+            'deletion_requested_at' 
         ]
-
         extra_kwargs = {
             'password': {'write_only': True},
             'main_address': {'required': False, 'allow_null': True}
         }
 
-    def get_avatar(self, obj):
-        request = self.context.get('request')
-        if obj.avatar and hasattr(obj.avatar, 'url'):
-            return request.build_absolute_uri(obj.avatar.url) if request else obj.avatar.url
-        return None
+    def get_avatar_url(self, obj):
+        f = getattr(obj, 'avatar', None)
+        if not f:
+            return None
+        try:
+            url = f.url
+        except Exception:
+            return None
+        request = self.context.get("request")
+        if request and not url.startswith(("http://", "https://")):
+            return request.build_absolute_uri(url)
+        return url
 
     def validate_date_of_birth(self, value):
         today = date.today()
@@ -99,28 +114,39 @@ class CustomUserSerializer(serializers.ModelSerializer):
         user_type = self.initial_data.get('type') or getattr(self.instance, 'type', None)
         if user_type != 'producer' and value > 0:
             raise serializers.ValidationError("Seuls les producteurs peuvent renseigner leurs années d'expérience.")
-        return value 
-        
+        return value
+
+    def _get_usersetting(self, obj):
+        us = getattr(obj, 'usersetting', None)
+        if us is not None:
+            return us
+        return UserSetting.objects.filter(user=obj).only('account_deletion_requested').first()
+
+    def get_deletion_requested(self, obj):
+        direct = getattr(obj, 'deletion_requested', None)
+        if isinstance(direct, bool):
+            return direct
+        us = self._get_usersetting(obj)
+        return bool(getattr(us, 'account_deletion_requested', None))
+
+    def get_deletion_requested_at(self, obj):
+        direct_at = getattr(obj, 'deletion_requested_at', None)
+        if direct_at:
+            return direct_at
+        us = self._get_usersetting(obj)
+        return getattr(us, 'account_deletion_requested', None)
+    
     def create(self, validated_data):
+        password = validated_data.pop('password')
         user = CustomUser.objects.create_user(
-            email=validated_data['email'],
-            first_name=validated_data['first_name'],
-            last_name=validated_data['last_name'],
-            password=validated_data['password'],
-            type=validated_data['type'],
-            date_of_birth=validated_data['date_of_birth'],
+            password=password,
+            **validated_data
         )
-        user.phone = validated_data.get('phone', '')
-        user.public_display_name = validated_data.get('public_display_name', '')
-        user.avatar = validated_data.get('avatar')
-        user.main_address = validated_data.get('main_address')
-        user.description_utilisateur = validated_data.get('description_utilisateur')
-        user.years_of_experience = validated_data.get('years_of_experience', 0)
-        user.save()
         return user
 
+
 class UserSerializer(serializers.ModelSerializer):
-    avatar = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomUser
@@ -130,9 +156,30 @@ class UserSerializer(serializers.ModelSerializer):
             'last_name',
             'email',
             'type',
-            'avatar',
-            'public_display_name'
+            'phone',
+            'date_of_birth',
+            'avatar_url',  # URL absoluta para lectura
+            'public_display_name',
+            'main_address',
+            'description_utilisateur',
+            'years_of_experience',
+            'is_staff',
         ]
+
+    def get_avatar_url(self, obj):
+        f = getattr(obj, 'avatar', None)
+        if not f:
+            return None
+        try:
+            url = f.url
+        except Exception:
+            return None
+        request = self.context.get("request")
+        if request and not url.startswith(("http://", "https://")):
+            return request.build_absolute_uri(url)
+        return url
+    
+    
 
 class ProducerSerializer(serializers.ModelSerializer):
     avatar = serializers.SerializerMethodField()
@@ -1046,6 +1093,8 @@ class PublicProducerSerializer(serializers.ModelSerializer):
     avg_rating = serializers.DecimalField(max_digits=3, decimal_places=2, read_only=True)
     ratings_count = serializers.IntegerField(read_only=True)
 
+    avatar = serializers.SerializerMethodField()
+
     class Meta:
         model = CustomUser
         fields = [
@@ -1062,8 +1111,12 @@ class PublicProducerSerializer(serializers.ModelSerializer):
         return dt.isoformat() if dt else None
 
     def get_commerces(self, obj):
-        qs = Company.objects.filter(owner=obj).distinct()
-        return PublicCompanySerializer(qs, many=True, context=self.context).data
+        companies_qs = getattr(obj, "companies", None)
+        if companies_qs is not None:
+            companies_qs = companies_qs.all()  
+        else:
+            companies_qs = Company.objects.filter(owner=obj, is_active=True)
+        return PublicCompanySerializer(companies_qs, many=True, context=self.context).data
 
     def _get_primary_address(self, obj):
         addr = getattr(obj, "main_address", None)
@@ -1096,7 +1149,17 @@ class PublicProducerSerializer(serializers.ModelSerializer):
         except AttributeError:
             return None
 
-
+    def get_avatar(self, obj):
+        if not obj.avatar:
+            return None
+        try:
+            url = obj.avatar.url
+        except Exception:
+            return None
+        request = self.context.get("request")
+        if request and not url.startswith(("http://", "https://")):
+            return request.build_absolute_uri(url)
+        return url
 
 # === Sérialiseurs pour le blog ===
 
@@ -1224,6 +1287,177 @@ class BlogPostPublicSerializer(serializers.ModelSerializer):
             "read_time_min",
             "category",
         ]
+
+
+
+
+
+class ProductImageThumbSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductImage
+        fields = ("id", "image", "alt_text")
+
+class ProductSummarySerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source="company.name", read_only=True)
+
+    class Meta:
+        model = Product
+        fields = ("id", "name", "slug", "company_name")
+
+class ProductBundleItemSummarySerializer(serializers.ModelSerializer):
+    product = ProductSummarySerializer()
+
+    class Meta:
+        model = ProductBundleItem
+        fields = ("id", "quantity", "product")
+
+class ProductBundleSummarySerializer(serializers.ModelSerializer):
+    image = serializers.SerializerMethodField()
+    items = ProductBundleItemSummarySerializer(many=True)
+
+    def get_image(self, obj):
+        for bi in getattr(obj, "items", []):
+            prod = getattr(bi, "product", None)
+            if not prod:
+                continue
+            imgs = list(getattr(prod, "images", []))
+            if imgs:
+                img = imgs[0]
+                return {
+                    "id": img.id,
+                    "image": getattr(img, "image", None).url if getattr(img, "image", None) else None,
+                    "alt_text": getattr(img, "alt_text", "") or "",
+                }
+        return None
+
+    class Meta:
+        model = ProductBundle
+        fields = (
+            "id", "title", "slug",
+            "price", "discounted_price",
+            "avg_rating", "ratings_count",
+            "stock",
+            "items",
+            "image",
+        )
+
+class OrderItemListSerializer(serializers.ModelSerializer):
+    bundle = serializers.SerializerMethodField()
+
+    def get_bundle(self, obj):
+        b = getattr(obj, "bundle", None)
+        if not b:
+            return None
+        thumb = None
+        for bi in getattr(b, "items", []):
+            prod = getattr(bi, "product", None)
+            if not prod:
+                continue
+            imgs = list(getattr(prod, "images", []))
+            if imgs:
+                img = imgs[0]
+                thumb = {
+                    "id": img.id,
+                    "image": getattr(img, "image", None).url if getattr(img, "image", None) else None,
+                    "alt_text": getattr(img, "alt_text", "") or "",
+                }
+                break
+        return {
+            "id": b.id,
+            "title": getattr(b, "title", ""),
+            "slug": getattr(b, "slug", ""),
+            "price": getattr(b, "price", None),
+            "discounted_price": getattr(b, "discounted_price", None),
+            "image": thumb,
+        }
+
+    class Meta:
+        model = OrderItem
+        fields = (
+            "id", "quantity", "unit_price", "total_price",
+            "avoided_waste_kg", "avoided_co2_kg",
+            "bundle",
+        )
+
+class OrderListSerializer(serializers.ModelSerializer):
+    items = OrderItemListSerializer(many=True)
+
+    class Meta:
+        model = Order
+        fields = (
+            "id", "order_code", "status",
+            "subtotal", "shipping_cost", "total_price",
+            "order_total_savings",
+            "order_total_avoided_waste_kg", "order_total_avoided_co2_kg",
+            "created_at",
+            "items",
+        )
+
+
+
+class CompanyMiniSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Company
+        fields = ("id", "name", "logo", "avg_rating", "ratings_count")
+
+
+class CatalogMiniSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductCatalog
+        fields = ("id", "name")
+
+
+class ProductMiniSerializer(serializers.ModelSerializer):
+    company = CompanyMiniSerializer(read_only=True)
+    catalog_entry = CatalogMiniSerializer(read_only=True)
+
+    class Meta:
+        model = Product
+        fields = (
+            "id", "title", "unit", "stock", "original_price",
+            # If your Product image field has a different name, add it here later.
+            # "image",
+            "company", "catalog_entry",
+        )
+
+
+class BundleItemSerializer(serializers.ModelSerializer):
+    product = ProductMiniSerializer(read_only=True)
+
+    class Meta:
+        model = ProductBundleItem
+        fields = ("id", "quantity", "product")
+
+
+class PublicBundleListSerializer(serializers.ModelSerializer):
+    # Derive a “primary company” from items[0].product.company,
+    # using prefetched data (no DB hits).
+    company = serializers.SerializerMethodField()
+    items = BundleItemSerializer(many=True, read_only=True)
+    avg_rating = serializers.FloatField(source="avg_rating_safe")
+    ratings_count = serializers.IntegerField(source="ratings_count_safe")
+
+    class Meta:
+        model = ProductBundle
+        fields = (
+            "id", "title", "status", "stock",
+            "discounted_percentage", "discounted_price", "original_price",
+            "avg_rating", "ratings_count",
+            "total_avoided_waste_kg", "total_avoided_co2_kg",
+            "company", "items",
+        )
+
+    def get_company(self, obj):
+        # Use the first item’s product.company as the representative company
+        # (change logic if you prefer another rule)
+        items = getattr(obj, "items", None) or []
+        for bi in items:
+            prod = getattr(bi, "product", None)
+            comp = getattr(prod, "company", None)
+            if comp is not None:
+                return CompanyMiniSerializer(comp).data
+        return None
+    
 
 
 # === Autres ===

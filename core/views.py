@@ -2,21 +2,27 @@ import json
 import requests
 import os
 from django.db import transaction
-from django.db.models import F, Sum, Count, Exists, OuterRef, Q
+from django.db.models import F, Sum, Count, Exists, OuterRef, Q, Prefetch, Value, FloatField, IntegerField
 from django.db.models.functions import Coalesce
 from datetime import datetime, date
 from django.db.models import ImageField, Prefetch
+from rest_framework.pagination import LimitOffsetPagination
 
 from decimal import Decimal, ROUND_HALF_UP
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.db.models.deletion import ProtectedError
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.timezone import now
 from rest_framework import viewsets, status, filters, generics, permissions
 from rest_framework.decorators import action
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+
+
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 from rest_framework.response import Response
@@ -26,8 +32,17 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.exceptions import PermissionDenied
 from core.mixins.responses import StandardResponseMixin
-from .utils import export_user_data, get_or_create_cart, recompute_after_bundle
+from .utils import (
+    export_user_data, 
+    get_or_create_cart, 
+    recompute_after_bundle,
+    hard_delete_user_and_related)
 from dateutil.relativedelta import relativedelta
+
+
+
+import logging, traceback
+logger = logging.getLogger(__name__)
 
 from .models import (
     City,
@@ -63,6 +78,7 @@ from .models import (
 )
 
 from .serializers import (
+    UserSerializer,
     CustomUserSerializer, 
     AddressSerializer, 
     CompanySerializer,
@@ -87,12 +103,30 @@ from .serializers import (
     BlogPostReadSerializer,
     BlogPostWriteSerializer,
     BlogPostPublicSerializer,
+    ProductBundleSummarySerializer,
+    OrderListSerializer,
+    PublicBundleListSerializer,
 
     AboutSectionSerializer, 
     CoreValueSerializer, 
     LegalInformationSerializer,
     SiteSettingSerializer
 )
+
+
+from typing import List, Set, Dict
+from core.recommendations import rank_copurchased_candidates
+
+
+def cached_first(iterable_or_manager):
+    """Return the first element from a prefetched relation without hitting the DB."""
+    try:
+        it = iter(iterable_or_manager) 
+    except TypeError:
+        it = iter(iterable_or_manager.all()) 
+    return next(it, None)
+
+
 
 def calculate_bundle_impact(bundle):
     total_waste = Decimal("0.0")
@@ -103,11 +137,11 @@ def calculate_bundle_impact(bundle):
         unit = item.product.unit
         quantity = Decimal(item.quantity) * bundle.stock
 
-        impact_entry = ProductImpact.objects.filter(
+        impact_entry = cached_first(ProductImpact.objects.filter(
             product=catalog_entry,
             unit=unit,
             quantity=Decimal("1.0")
-        ).first()
+        ))
 
         if impact_entry:
             total_waste += quantity * impact_entry.avoided_waste_kg
@@ -186,6 +220,8 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
+
+
 # === Gestion des utilisateurs ===
 
 class RegisterUserView(APIView):
@@ -202,7 +238,7 @@ class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        serializer = CustomUserSerializer(request.user)
+        serializer = UserSerializer(request.user)
         return Response(serializer.data)
 
     def patch(self, request):
@@ -211,6 +247,237 @@ class MeView(APIView):
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=400)
+
+
+class AdminUsersView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can list users.", status.HTTP_403_FORBIDDEN)
+
+        qs = (User.objects
+            .all()
+            .select_related('usersetting')
+            .order_by("-date_joined" if hasattr(User, "date_joined") else "-id"))
+    
+        user_type = request.query_params.get("type")
+        if user_type in ("producer", "customer"):
+            qs = qs.filter(type=user_type)
+
+        is_active = request.query_params.get("is_active")
+        if is_active in ("true", "false"):
+            qs = qs.filter(is_active=(is_active == "true"))
+
+        q = request.query_params.get("q")
+        if q:
+            qs = qs.filter(
+                Q(email__icontains=q) |
+                Q(first_name__icontains=q) |
+                Q(last_name__icontains=q) |
+                Q(public_display_name__icontains=q)
+            )
+
+        data = CustomUserSerializer(qs, many=True, context={"request": request}).data
+
+        # Option A: return wrapped (keep StandardResponse style)
+        return self.standard_response(True, "Users fetched.", data=data, status_code=status.HTTP_200_OK)
+
+        # Option B (if you prefer raw array, uncomment next line and remove standard_response above):
+        # return Response(data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can create users.", status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        for f in ("type", "first_name", "last_name", "email", "password"):
+            if not data.get(f):
+                return self.standard_response(False, f"Missing required field: {f}", status.HTTP_400_BAD_REQUEST)
+
+        user_type = data.get("type")
+        if user_type not in ("producer", "customer"):
+            return self.standard_response(False, "Invalid type. Must be 'producer' or 'customer'.", status.HTTP_400_BAD_REQUEST)
+
+        dob = None
+        dob_str = data.get("date_of_birth")
+        if dob_str:
+            try:
+                dob = date.fromisoformat(dob_str)
+            except ValueError:
+                return self.standard_response(False, "Invalid date_of_birth. Use YYYY-MM-DD.", status.HTTP_400_BAD_REQUEST)
+
+        years = data.get("years_of_experience")
+        try:
+            years = int(years) if years not in (None, "",) else 0
+        except ValueError:
+            return self.standard_response(False, "Invalid years_of_experience. Must be an integer.", status.HTTP_400_BAD_REQUEST)
+
+        avatar_file = request.FILES.get("avatar")
+
+        user = User.objects.create_user(
+            email=data.get("email"),
+            password=data.get("password"),
+            first_name=data.get("first_name"),
+            last_name=data.get("last_name"),
+            type=user_type,
+            phone=data.get("phone") or "",
+            date_of_birth=dob,
+            public_display_name=data.get("public_display_name") or "",
+            years_of_experience=years,
+            description_utilisateur=data.get("description") or "",
+            is_active=True,
+        )
+
+        if avatar_file:
+            user.avatar = avatar_file
+            user.save(update_fields=["avatar"])
+
+        serialized = CustomUserSerializer(user, context={"request": request}).data
+        return self.standard_response(True, "User created successfully.", data=serialized, status_code=status.HTTP_201_CREATED)
+
+
+class AdminDeletionRequestedCustomersView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can list users.", status.HTTP_403_FORBIDDEN)
+
+        qs = (User.objects
+              .filter(type="customer")
+              .select_related('usersetting')
+              .filter(usersetting__account_deletion_requested__isnull=False)
+              .order_by("-usersetting__account_deletion_requested", "-id"))
+
+        data = CustomUserSerializer(qs, many=True, context={"request": request}).data
+        return self.standard_response(True, "Customers with deletion requested fetched.", data=data, status_code=status.HTTP_200_OK)
+    
+
+class AdminUserUpdateView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def patch(self, request, pk):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can edit users.", status.HTTP_403_FORBIDDEN)
+
+        user = get_object_or_404(User, pk=pk)
+
+        # Allowed fields to update logically (profile fields)
+        allowed_fields = {
+            "type", "first_name", "last_name", "email", "phone",
+            "date_of_birth", "public_display_name", "years_of_experience",
+            "description_utilisateur"
+        }
+
+        # Copy only allowed fields
+        data = {k: v for k, v in request.data.items() if k in allowed_fields}
+
+        # Avatar optional in multipart
+        avatar_file = request.FILES.get("avatar")
+        if avatar_file:
+            data["avatar"] = avatar_file
+
+        serializer = CustomUserSerializer(user, data=data, partial=True, context={"request": request})
+        if serializer.is_valid():
+            serializer.save()
+            return self.standard_response(True, "User updated.", data=serializer.data, status_code=status.HTTP_200_OK)
+
+        return self.standard_response(False, "Validation error.", errors=serializer.errors, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+class AdminUserDeactivateView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can deactivate users.", status.HTTP_403_FORBIDDEN)
+
+        user = get_object_or_404(User, pk=pk)
+        if not user.is_active:
+            return self.standard_response(True, "User already inactive.", data={"id": user.pk, "is_active": user.is_active}, status_code=status.HTTP_200_OK)
+
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+        return self.standard_response(True, "User deactivated.", data={"id": user.pk, "is_active": user.is_active}, status_code=status.HTTP_200_OK)
+
+
+class AdminUserActivateView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        if not request.user.is_superuser:
+            return self.standard_response(False, "Only superusers can activate users.", status.HTTP_403_FORBIDDEN)
+
+        user = get_object_or_404(User, pk=pk)
+        if user.is_active:
+            return self.standard_response(True, "User already active.", data={"id": user.pk, "is_active": user.is_active}, status_code=status.HTTP_200_OK)
+
+        user.is_active = True
+        user.save(update_fields=["is_active"])
+        return self.standard_response(True, "User activated.", data={"id": user.pk, "is_active": user.is_active}, status_code=status.HTTP_200_OK)
+
+
+class AdminUserHardDeleteView(StandardResponseMixin, APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        if not request.user.is_superuser:
+            return self.standard_response(
+                False, "Only superusers can hard-delete users.",
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+
+        user = get_object_or_404(User, pk=pk)
+        if getattr(user, "is_superuser", False):
+            return self.standard_response(
+                False, "Refusing to hard-delete a superuser.",
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            logger.info("Hard delete START user_id=%s admin_id=%s", user.id, request.user.id)
+            metrics = hard_delete_user_and_related(user.id)
+            logger.info("Hard delete OK user_id=%s metrics=%s", user.id, metrics)
+        except User.DoesNotExist:
+            logger.warning("Hard delete: user already deleted user_id=%s", pk)
+            return self.standard_response(True, "User already deleted.", status_code=status.HTTP_200_OK)
+        except ProtectedError as e:
+            logger.exception("Hard delete PROTECT conflict user_id=%s", pk)
+            return self.standard_response(
+                False, f"Deletion blocked by PROTECT: {str(e)}",
+                status_code=status.HTTP_409_CONFLICT
+            )
+        except Exception as e:
+            logger.exception("Hard delete FAILED user_id=%s", pk)
+            if request.user.is_superuser and request.query_params.get("debug") == "1":
+                tb = traceback.format_exc()
+                return self.standard_response(
+                    False, {"message": f"Deletion failed: {str(e)}", "traceback": tb},
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            return self.standard_response(
+                False, f"Deletion failed: {str(e)}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # Verificación final
+        if User.objects.filter(pk=pk).exists():
+            logger.error("Hard delete post-check: user STILL EXISTS user_id=%s", pk)
+            return self.standard_response(
+                False,
+                "Deletion executed but user still exists (check FK on_delete or DB constraints).",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return self.standard_response(
+            True,
+            {"message": "User and related data permanently deleted.", "metrics": metrics},
+            status_code=status.HTTP_200_OK,
+        )
+    
 
 class VerifyPasswordView(APIView):
     permission_classes = [IsAuthenticated]
@@ -232,7 +499,7 @@ class UserDetailViewSet(StandardResponseMixin, viewsets.ViewSet):
 
     def retrieve(self, request, pk=None):
         user = get_object_or_404(User, pk=pk)
-        serializer = CustomUserSerializer(user)
+        serializer = CustomUserSerializer(user, context={'request': request})
         return self.standard_response(
             success=True,
             message="Données de l'utilisateur récupérées.",
@@ -242,16 +509,10 @@ class UserDetailViewSet(StandardResponseMixin, viewsets.ViewSet):
 
     def partial_update(self, request, pk=None):
         user = get_object_or_404(User, pk=pk)
-
         if request.user.pk != user.pk and not request.user.is_staff:
-            return self.standard_response(
-                success=False,
-                message='Non autorisé.',
-                status_code=status.HTTP_403_FORBIDDEN
-            )
+            return self.standard_response(success=False, message='Non autorisé.', status_code=status.HTTP_403_FORBIDDEN)
 
-        serializer = CustomUserSerializer(user, data=request.data, partial=True)
-        
+        serializer = CustomUserSerializer(user, data=request.data, partial=True, context={'request': request})
         if serializer.is_valid():
             serializer.save()
             return self.standard_response(
@@ -267,7 +528,6 @@ class UserDetailViewSet(StandardResponseMixin, viewsets.ViewSet):
                 errors=serializer.errors,
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-
 
 
 
@@ -295,7 +555,7 @@ class PostalCodesListAPIView(APIView):
 
 class PostalInfoAPIView(APIView):
     def get(self, request, postal_code):
-        city = City.objects.filter(postal_code=postal_code).first()
+        city = cached_first(City.objects.filter(postal_code=postal_code))
         if not city:
             return Response({'detail': 'Code postal non trouvé'}, status=404)
 
@@ -477,7 +737,6 @@ class ProductViewSet(StandardResponseMixin, viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        #print(self.request.data) 
         if 'catalog_entry' not in serializer.validated_data:
             raise ValidationError("Le champ 'catalog_entry' est requis.")
         company = serializer.validated_data.get('company')
@@ -494,7 +753,6 @@ class ProductViewSet(StandardResponseMixin, viewsets.ModelViewSet):
             raise PermissionDenied("Vous ne pouvez modifier que vos propres produits.")
         product = serializer.save()
 
-        # Supprimer les images
         keep_ids = self.request.data.get("keep_image_ids", "")
         keep_ids = [int(i) for i in keep_ids.split(",") if i.isdigit()]
         product.images.exclude(id__in=keep_ids).delete()
@@ -675,10 +933,10 @@ class PublicProductBundleDetailView(RetrieveAPIView):
     lookup_field = 'id'
 
 
-class PublicProductBundleListView(ListAPIView):
-    queryset = ProductBundle.objects.filter(is_active=True, status='published')
-    serializer_class = ProductBundleSerializer
-    permission_classes = [AllowAny]
+#class PublicProductBundleListView(ListAPIView):
+#    queryset = ProductBundle.objects.filter(is_active=True, status='published')
+#    serializer_class = ProductBundleSerializer
+#    permission_classes = [AllowAny]
 
 
 class PaymentMethodViewSet(viewsets.ModelViewSet):
@@ -791,12 +1049,38 @@ class OrderViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_staff:
-            return Order.objects.all().order_by('-created_at')
-        return Order.objects.filter(user=user).order_by('-created_at')
+        from django.db.models import Prefetch
 
-    # ---------- helpers internos para snapshots ----------
+        user = self.request.user
+
+        bundle_items_qs = (
+            ProductBundleItem.objects
+            .select_related("product__company__address__city__department__region",
+                            "product__catalog_entry")
+            .prefetch_related("product__images")
+            .order_by("id")
+        )
+        items_qs = (
+            OrderItem.objects
+            .filter(is_active=True)
+            .select_related("bundle")
+            .prefetch_related(Prefetch("bundle__items", queryset=bundle_items_qs))
+        )
+
+        base = (
+            Order.objects
+            .order_by("-created_at")
+            .select_related(
+                "shipping_address__city__department__region",
+                "billing_address__city__department__region",
+                "payment_method",
+            )
+            .prefetch_related(Prefetch("items", queryset=items_qs))
+        )
+    
+        return base if user.is_staff else base.filter(user=user)
+
+    # ---------- helpers snapshots ----------
     def _address_snapshot(self, addr: Address) -> dict:
         """
         Snapshot PLANO coherente con analytics:
@@ -975,8 +1259,8 @@ class OrderViewSet(viewsets.ModelViewSet):
                         "category_name": cat_label,
                     })
 
-                # empresa + productor + zona para snapshot del bundle
-                first_item = bundle_items.first()
+                #  snapshot del bundle
+                first_item = cached_first(bundle_items)
                 company_id = None
                 company_name = None
                 department_payload = None
@@ -1111,6 +1395,8 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response(OrderItemSerializer(item, context={'request': request}).data, status=200)
     
 
+
+
 class FavoriteViewSet(viewsets.ModelViewSet):
     serializer_class = FavoriteSerializer
     permission_classes = [IsAuthenticated]
@@ -1132,7 +1418,7 @@ class FavoriteViewSet(viewsets.ModelViewSet):
         if fav_qs.filter(is_active=True).exists():
             return Response({"detail": "Ce lot est déjà dans vos favoris."}, status=400)
 
-        fav = fav_qs.first()
+        fav = cached_first(fav_qs)
         if fav:
             fav.is_active = True
             fav.deactivated_at = None
@@ -1368,13 +1654,13 @@ class CartViewSet(viewsets.ViewSet):
         qs = Cart.objects.filter(is_active=True)
 
         if user:
-            cart = qs.filter(user=user).order_by('-updated_at').first()
+            cart = cached_first(qs.filter(user=user).order_by('-updated_at'))
             if not cart:
                 cart = Cart.objects.create(user=user, session_key=None)
             return cart
 
         session_key = self._require_guest_key(request)
-        cart = qs.filter(session_key=session_key, user__isnull=True).order_by('-updated_at').first()
+        cart = cached_first(qs.filter(session_key=session_key, user__isnull=True).order_by('-updated_at'))
         if not cart:
             cart = Cart.objects.create(user=None, session_key=session_key)
         return cart
@@ -1416,9 +1702,9 @@ class CartViewSet(viewsets.ViewSet):
         price = bundle.discounted_price or bundle.original_price
 
         first_img = None
-        first_bundle_item = bundle.items.select_related('product').first()
+        first_bundle_item = cached_first(bundle.items.select_related('product'))
         if first_bundle_item and hasattr(first_bundle_item.product, 'images'):
-            pimg = first_bundle_item.product.images.order_by('id').first()
+            pimg = cached_first(first_bundle_item.product.images.order_by('id'))
             first_img = getattr(pimg, 'image', None)
         bundle_image_value = self._abs_media_url(request, first_img)
 
@@ -1448,9 +1734,9 @@ class CartViewSet(viewsets.ViewSet):
         dluo_text_value = max(best_dates).isoformat() if best_dates else ''
 
         with transaction.atomic():
-            existing = CartItem.objects.filter(
+            existing = cached_first(CartItem.objects.filter(
                 cart=cart, bundle=bundle, is_active=True
-            ).select_for_update().first()
+            ).select_for_update())
 
             if existing:
                 existing.quantity = int(existing.quantity) + qty
@@ -1564,9 +1850,9 @@ class CartViewSet(viewsets.ViewSet):
 
         if request.data.get('refresh_image', False) or not item.bundle_image:
             first_img = None
-            first_bundle_item = item.bundle.items.select_related('product').first()
+            first_bundle_item = cached_first(item.bundle.items.select_related('product'))
             if first_bundle_item and hasattr(first_bundle_item.product, 'images'):
-                pimg = first_bundle_item.product.images.order_by('id').first()
+                pimg = cached_first(first_bundle_item.product.images.order_by('id'))
                 first_img = getattr(pimg, 'image', None)
             item.bundle_image = self._abs_media_url(request, first_img)
 
@@ -1604,7 +1890,7 @@ class CartViewSet(viewsets.ViewSet):
     def merge(self, request):
         session_key = request.headers.get('X-Session-Key') or request.data.get('session_key')
         user = request.user
-        user_cart = Cart.objects.filter(is_active=True, user=user).order_by('-updated_at').first()
+        user_cart = cached_first(Cart.objects.filter(is_active=True, user=user).order_by('-updated_at'))
 
         if not session_key:
             if not user_cart:
@@ -1613,9 +1899,9 @@ class CartViewSet(viewsets.ViewSet):
             return Response(ser.data)
 
         guest_cart = (
-            Cart.objects.filter(is_active=True, user__isnull=True, session_key=session_key)
+            cached_first(Cart.objects.filter(is_active=True, user__isnull=True, session_key=session_key)
             .order_by('-updated_at')
-            .first()
+            )
         )
 
         if not guest_cart:
@@ -1632,9 +1918,9 @@ class CartViewSet(viewsets.ViewSet):
                 cart=guest_cart, is_active=True
             )
             for gi in guest_items:
-                existing = CartItem.objects.select_for_update().filter(
+                existing = cached_first(CartItem.objects.select_for_update().filter(
                     cart=user_cart, bundle=gi.bundle, is_active=True
-                ).first()
+                ))
 
                 if existing:
                     existing.quantity = int(existing.quantity) + int(gi.quantity or 0)
@@ -1826,6 +2112,7 @@ class PublicProducerDetailView(APIView):
         return Response(payload)
 
 
+@method_decorator(cache_page(60), name="dispatch")
 class PublicProducerListView(generics.ListAPIView):
     permission_classes = [AllowAny]
 
@@ -1834,6 +2121,9 @@ class PublicProducerListView(generics.ListAPIView):
         return s.PublicProducerSerializer
 
     def get_queryset(self):
+        from .models import Company, CustomUser
+        from django.db.models import Prefetch
+
         qs = (
             CustomUser.objects
             .filter(is_active=True, type="producer")
@@ -1841,10 +2131,9 @@ class PublicProducerListView(generics.ListAPIView):
             .prefetch_related("addresses__city__department__region")
             .order_by("-created_at")
         )
-
         qs = qs.prefetch_related(
             Prefetch(
-                "companies",  
+                "companies",
                 queryset=(
                     Company.objects
                     .filter(is_active=True)
@@ -1853,17 +2142,21 @@ class PublicProducerListView(generics.ListAPIView):
                 )
             )
         )
-
         return qs
+
 
 
 class ProducerOrdersView(ListAPIView):
     permission_classes = [IsAuthenticated]
-    serializer_class = OrderSerializer 
+    serializer_class = OrderSerializer
 
     def get_queryset(self):
+        from django.db.models import Exists, OuterRef, Prefetch
+        from .models import Order, OrderItem, ProductBundleItem, Company
+
         user = self.request.user
         if getattr(user, "type", None) != "producer":
+            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only producers can access this endpoint.")
 
         company_ids = list(
@@ -1875,11 +2168,22 @@ class ProducerOrdersView(ListAPIView):
             product__company_id__in=company_ids,
         )
 
+        bundle_items_qs = (
+            ProductBundleItem.objects
+            .select_related(
+                "product__company__address__city__department__region",
+                "product__catalog_entry",
+            )
+            .prefetch_related("product__images")
+            .order_by("id")
+        )
+
         producer_items = (
             OrderItem.objects
             .annotate(has_company=Exists(exists_company_item))
             .filter(has_company=True, is_active=True)
             .select_related("bundle")
+            .prefetch_related(Prefetch("bundle__items", queryset=bundle_items_qs))
         )
 
         include_all = (self.request.query_params.get("include_all_items", "false").lower() == "true")
@@ -1898,12 +2202,16 @@ class ProducerOrdersView(ListAPIView):
 
         if include_all:
             qs = qs.prefetch_related(
-                Prefetch("items", queryset=OrderItem.objects.filter(is_active=True).select_related("bundle"))
+                Prefetch(
+                    "items",
+                    queryset=OrderItem.objects
+                    .filter(is_active=True)
+                    .select_related("bundle")
+                    .prefetch_related(Prefetch("bundle__items", queryset=bundle_items_qs))
+                )
             )
         else:
-            qs = qs.prefetch_related(
-                Prefetch("items", queryset=producer_items)
-            )
+            qs = qs.prefetch_related(Prefetch("items", queryset=producer_items))
 
         return qs
 
@@ -2003,6 +2311,199 @@ class PublicBlogPostListView(generics.ListAPIView):
         ).select_related("category").order_by("-published_at")
 
 
+
+class RecommendationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            limit = int(request.GET.get("limit") or 3)
+            limit = max(1, min(limit, 12))
+        except Exception:
+            limit = 3
+
+        eligible_status = ("confirmed", "delivered", "fulfilled", "completed")
+
+        user_order_ids = (
+            Order.objects
+            .filter(user=request.user, status__in=eligible_status)
+            .values_list("id", flat=True)
+        )
+        user_bundle_ids: Set[int] = set(
+            OrderItem.objects
+            .filter(order_id__in=user_order_ids)
+            .values_list("bundle_id", flat=True)
+        )
+        has_history = len(user_bundle_ids) > 0
+
+        scores: Dict[int, float] = {}
+        if has_history:
+            other_user_order_ids = (
+                OrderItem.objects
+                .filter(bundle_id__in=user_bundle_ids)
+                .exclude(order__user=request.user)
+                .values_list("order_id", flat=True)
+                .distinct()
+            )
+            purchases_by_order: Dict[int, List[int]] = {}
+            for oid, bid in (
+                OrderItem.objects
+                .filter(order_id__in=other_user_order_ids)
+                .values_list("order_id", "bundle_id")
+            ):
+                purchases_by_order.setdefault(oid, []).append(bid)
+
+            if purchases_by_order:
+                scores = rank_copurchased_candidates(user_bundle_ids, purchases_by_order.values())
+
+        qs = ProductBundle.objects.filter(stock__gt=0)
+        if has_history:
+            qs = qs.exclude(id__in=user_bundle_ids)
+
+        if scores:
+            candidates = list(qs.values("id"))
+            for c in candidates:
+                c["score"] = scores.get(c["id"], 0.0)
+
+            ranked_ids = [
+                c["id"] for c in sorted(candidates, key=lambda x: x["score"], reverse=True)
+            ][: max(limit * 4, 50)]
+
+            ranked_qs = ProductBundle.objects.filter(id__in=ranked_ids)
+            ranked_serialized_list = ProductBundleSerializer(
+                ranked_qs, many=True, context={"request": request}
+            ).data
+
+            ranked_serialized = {b["id"]: b for b in ranked_serialized_list}
+            payload = []
+            for bid in ranked_ids:
+                b = ranked_serialized.get(bid)
+                if b:
+                    bb = dict(b)
+                    bb["_rec_score"] = scores.get(bid, 0.0)
+                    payload.append(bb)
+
+            if len(payload) < limit:
+                need = limit - len(payload)
+                try:
+                    fallback_qs = (
+                        ProductBundle.objects
+                        .filter(stock__gt=0)
+                        .exclude(id__in=set(ranked_ids) | user_bundle_ids)
+                        .order_by(
+                            F("discounted_percentage").desc(nulls_last=True),
+                            F("avg_rating").desc(nulls_last=True),
+                        )[: need]
+                    )
+                except Exception:
+                    fallback_qs = (
+                        ProductBundle.objects
+                        .filter(stock__gt=0)
+                        .exclude(id__in=set(ranked_ids) | user_bundle_ids)[: need]
+                    )
+
+                payload.extend(ProductBundleSerializer(
+                    fallback_qs, many=True, context={"request": request}
+                ).data)
+
+            return Response(payload[:limit])
+
+        try:
+            fallback_qs = (
+                ProductBundle.objects
+                .filter(stock__gt=0)
+                .order_by(
+                    F("discounted_percentage").desc(nulls_last=True),
+                    F("avg_rating").desc(nulls_last=True),
+                )[: limit]
+            )
+        except Exception:
+            fallback_qs = ProductBundle.objects.filter(stock__gt=0)[:limit]
+
+        return Response(ProductBundleSerializer(
+            fallback_qs, many=True, context={"request": request}
+        ).data)
+    
+def defer_if_exists(qs, model, *field_names):
+    """
+    Safely defer fields only if they actually exist on the model.
+    Prevents FieldDoesNotExist errors when models differ across environments.
+    """
+    existing = {f.name for f in model._meta.get_fields() if getattr(f, "attname", None)}
+    to_defer = [name for name in field_names if name in existing]
+    return qs.defer(*to_defer) if to_defer else qs
+
+
+@method_decorator(cache_page(60), name="dispatch") 
+class PublicProductBundleListView(ListAPIView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = ProductBundleSerializer
+
+    def get_queryset(self):
+        items_qs = (
+            ProductBundleItem.objects
+            .select_related("product__company__address__city__department__region",
+                            "product__catalog_entry")
+            .prefetch_related("product__images")
+            .order_by("id")  
+        )
+
+        qs = (
+            ProductBundle.objects
+            .filter(is_active=True, status="published")
+            .prefetch_related(Prefetch("items", queryset=items_qs))
+            .order_by("-id")
+        )
+
+        try:
+            qs = defer_if_exists(qs, ProductBundle, "long_description", "description")
+        except Exception:
+            pass
+
+        return qs
+        
+
+class PublicBundlesPagination(LimitOffsetPagination):
+    default_limit = 20
+    max_limit = 100
+
+
+
+
+@method_decorator(cache_page(60), name="dispatch")
+class PublicBundlesView(ListAPIView):
+    """
+    """
+    serializer_class = PublicBundleListSerializer
+    pagination_class = PublicBundlesPagination
+
+    def get_queryset(self):
+        # Prefetch bundle items and hop to product -> company to avoid N+1
+        items_qs = (
+            ProductBundleItem.objects
+            .select_related(
+                "product",
+                "product__company",
+                "product__catalog_entry",
+            )
+        )
+
+        return (
+            ProductBundle.objects
+            .filter(is_active=True, stock__gt=0)
+            # DO NOT select_related("company", ...) because bundle has no such field
+            .prefetch_related(
+                Prefetch("items", queryset=items_qs),
+            )
+            # Safe defaults so serializer never sees nulls for rating counters
+            .annotate(
+                avg_rating_safe=Coalesce("avg_rating", Value(0.0), output_field=FloatField()),
+                ratings_count_safe=Coalesce("ratings_count", Value(0), output_field=IntegerField()),
+            )
+            .order_by("-id")
+        )
+
+    
 
 
 class CreatePayPalOrderView(APIView):

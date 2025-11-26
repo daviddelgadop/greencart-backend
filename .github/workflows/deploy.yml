@@ -1,0 +1,30 @@
+name: Deploy to Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main 
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install AWS CLI
+        run: pip install awsebcli
+
+      - name: Deploy to EB
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-west-3
+        run: |
+          eb init greencart-api --platform python-3.11 --region eu-west-3
+          eb deploy greencart-api-env

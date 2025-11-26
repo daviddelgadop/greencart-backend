@@ -3,11 +3,19 @@ import json
 import tempfile
 import zipfile
 from decimal import Decimal
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, Q, QuerySet
 from .models import (
-    Cart, OrderItem, ProductBundle, ProductBundleItem, Product,
-    Company, CustomUser
+    Cart, 
+    OrderItem, 
+    ProductBundle, 
+    Product,
+    CustomUser
 )
+from django.db import transaction
+from django.contrib.auth import get_user_model
+from typing import Dict, Any
+
+User = get_user_model()
 
 def export_user_data(user):
     from .serializers import (
@@ -134,6 +142,7 @@ def recompute_producer_rating(producer_id: int):
     CustomUser.objects.filter(id=producer_id).update(avg_rating=avg, ratings_count=len(vals))
     return avg, len(vals)
 
+
 def recompute_after_bundle(bundle_id: int):
     # Cascade: bundle -> products -> company -> producer
     from .models import ProductBundleItem
@@ -163,3 +172,170 @@ def recompute_after_bundle(bundle_id: int):
     for uid in set(producer_ids):
         if uid:
             recompute_producer_rating(uid)
+
+
+
+def hard_delete_user_and_related(user_id: int) -> Dict[str, Any]:
+    """
+    Suppression définitive d’un utilisateur et de toutes ses données associées,
+    en renvoyant des métriques détaillées.
+
+    Ordre de suppression (pour éviter PROTECT et les objets orphelins) :
+      1) Supprimer les médias de l’utilisateur (avatar).
+      2) Identifier et supprimer les ProductBundle liés aux produits des companies de l’utilisateur :
+         - Supprimer les images de chaque bundle.
+         - Supprimer les bundles (ProductBundleItem supprimé par CASCADE ;
+           Favorite/CartItem supprimés par CASCADE ; OrderItem.bundle = SET_NULL).
+      3) Supprimer les médias des companies (logo, images de produits, certifications)
+         puis supprimer les companies (ce qui supprime aussi Product / ProductImage par CASCADE).
+      4) Supprimer l’utilisateur (Address et autres entités supprimées par CASCADE/SET_NULL).
+    """
+    from .models import (
+        Company,
+        Product,
+        ProductImage,
+        ProductBundle,
+        ProductBundleImage,
+        ProductBundleItem,
+        Certification,
+    )
+
+    metrics: Dict[str, Any] = {
+        "user_id": user_id,
+        "avatar_files_deleted": 0,
+        "bundles_found": 0,
+        "bundle_images_deleted": 0,
+        "bundles_deleted": 0,
+        "bundle_items_deleted": 0,         # estimé à partir du comptage avant delete
+        "companies_found": 0,
+        "company_logos_deleted": 0,
+        "products_found": 0,
+        "product_images_deleted": 0,
+        "cert_files_deleted": 0,
+        "companies_deleted": 0,
+        "products_deleted": 0,             # estimé (CASCADE via Company)
+        "product_images_rows_deleted": 0,  # estimé (CASCADE via Product)
+        "certifications_deleted": 0,       # estimé (CASCADE via Company)
+        "user_deleted": 0,
+    }
+
+    def _safe_delete_file(file_field) -> int:
+        # Supprime le fichier du storage si présent, ignore les erreurs.
+        try:
+            if file_field and getattr(file_field, "name", None):
+                name = file_field.name
+                storage = file_field.storage
+                file_field.delete(save=False)  # enlève la référence du modèle
+                if storage.exists(name):
+                    storage.delete(name)
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    with transaction.atomic():
+        # Chargement de l’utilisateur avec verrouillage
+        user = User.objects.select_for_update().get(pk=user_id)
+
+        # Étape 1 : avatar de l’utilisateur
+        metrics["avatar_files_deleted"] += _safe_delete_file(getattr(user, "avatar", None))
+
+        # Étape 2 : bundles liés aux produits des companies de l’utilisateur
+        company_ids = list(
+            Company.objects.filter(owner=user).values_list("id", flat=True)
+        )
+        if company_ids:
+            bundles_qs = (
+                ProductBundle.objects
+                .filter(items__product__company_id__in=company_ids)
+                .distinct()
+                .prefetch_related("images", "items")
+            )
+            metrics["bundles_found"] = bundles_qs.count()
+
+            # Compter items avant la suppression (estimation)
+            metrics["bundle_items_deleted"] = ProductBundleItem.objects.filter(
+                bundle__in=bundles_qs
+            ).count()
+
+            # Supprimer images de bundles
+            for bundle in bundles_qs:
+                for bimg in getattr(bundle, "images", []).all():
+                    metrics["bundle_images_deleted"] += _safe_delete_file(
+                        getattr(bimg, "image", None)
+                    )
+
+            # Supprimer bundles (CASCADE: items; CASCADE: favorites/cartitems; SET_NULL: orderitems)
+            num_deleted, details = bundles_qs.delete()  # <- desempaquetar
+            if isinstance(details, dict):
+                metrics["bundles_deleted"] = details.get(
+                    f"{ProductBundle._meta.app_label}.{ProductBundle._meta.model_name}", 0
+                )
+            else:
+                metrics["bundles_deleted"] = num_deleted 
+
+        # Étape 3 : companies de l’utilisateur (et médias associés)
+        companies_qs = Company.objects.filter(owner=user).prefetch_related(
+            "products__images",
+            "certifications",
+            "products",
+        )
+        metrics["companies_found"] = companies_qs.count()
+
+        # Compter produits / images / certifs avant suppressions (pour métriques)
+        products_qs = Product.objects.filter(company__owner=user)
+        product_images_qs = ProductImage.objects.filter(product__company__owner=user)
+        certs_qs = Certification.objects.filter(company__owner=user)
+        metrics["products_found"] = products_qs.count()
+
+        # Nettoyage de médias (logos, images de produit, fichiers de certification)
+        for company in companies_qs:
+            metrics["company_logos_deleted"] += _safe_delete_file(getattr(company, "logo", None))
+            for product in getattr(company, "products", []).all():
+                for pimg in getattr(product, "images", []).all():
+                    metrics["product_images_deleted"] += _safe_delete_file(
+                        getattr(pimg, "image", None)
+                    )
+            for cert in getattr(company, "certifications", []).all():
+                metrics["cert_files_deleted"] += _safe_delete_file(getattr(cert, "file", None))
+
+        # Suppression des companies (CASCADE: products, product images, certifications)
+        num_deleted_c, details_c = companies_qs.delete()  # <- desempaquetar
+        if isinstance(details_c, dict):
+            metrics["companies_deleted"] = details_c.get(
+                f"{Company._meta.app_label}.{Company._meta.model_name}", 0
+            )
+            metrics["products_deleted"] = details_c.get(
+                f"{Product._meta.app_label}.{Product._meta.model_name}", 0
+            )
+            metrics["product_images_rows_deleted"] = details_c.get(
+                f"{ProductImage._meta.app_label}.{ProductImage._meta.model_name}", 0
+            )
+            metrics["certifications_deleted"] = details_c.get(
+                f"{Certification._meta.app_label}.{Certification._meta.model_name}", 0
+            )
+        else:
+            metrics["companies_deleted"] = num_deleted_c
+
+        # Étape 4 : suppression de l’utilisateur (CASCADE/SET_NULL selon le modèle)
+        user_pk = user.pk
+        user.delete()
+        metrics["user_deleted"] = 0 if User.objects.filter(pk=user_pk).exists() else 1
+
+    return metrics
+
+def producer_id_for(request) -> int:
+    # If you have a ProducerProfile, map it here instead
+    return request.user.id
+
+def scope_orders_to_producer(qs: QuerySet, request) -> QuerySet:
+    """
+    Scope orders to commerces owned by the authenticated producer.
+    This must be applied BEFORE any annotate/values/union.
+    """
+    pid = producer_id_for(request)
+    return qs.filter(commerce__owner_id=pid)
+
+def scope_items_to_producer(qs: QuerySet, request) -> QuerySet:
+    pid = producer_id_for(request)
+    return qs.filter(order__commerce__owner_id=pid)

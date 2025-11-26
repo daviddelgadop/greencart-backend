@@ -5,11 +5,12 @@ from datetime import datetime
 from statistics import median
 from typing import Any, Dict, List, Tuple, Optional
 
-from django.db.models import Sum, Count, Avg, F, Q, Min, Max
+from django.db.models import Sum, Count, Avg, F, Q, Min, Max, Prefetch
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from decimal import Decimal
 
 from .models import (
     Order,
@@ -38,6 +39,17 @@ from .analytics_scope import AnalyticsScopeMixin
 # ---------------------------------------------------------------------
 # Utilitaires locaux
 # ---------------------------------------------------------------------
+
+def _extract_snapshot_companies(oi: OrderItem) -> List[Tuple[int, str]]:
+    snap = getattr(oi, "bundle_snapshot", None) or {}
+    prods = snap.get("products") or []
+    out, seen = [], set()
+    for p in prods:
+        cid, cname = p.get("company_id"), p.get("company_name")
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append((cid, cname or f"Company {cid}"))
+    return out
 
 def _safe_float(x) -> float:
     try:
@@ -414,48 +426,115 @@ class ExpiryVsVelocityView(AnalyticsScopeMixin, APIView):
 
 class PaymentsAovRatingsGeoView(AnalyticsScopeMixin, APIView):
     """
-    GET /api/producer/analytics/cross/payments-aov-ratings-geo/?date_from&date_to
-    GET /api/admin/analytics/cross/payments-aov-ratings-geo/?...
+    /api/<scope>/analytics/cross/payments-aov-ratings-geo/
     """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, **kwargs):
+    def get(self, request, *args, **kwargs):
         self.initialize_scope(request, **kwargs)
-        date_from, date_to = _date_range(request)
 
-        orders = _admin_scope_orders(date_from, date_to) if self.is_admin_scope else _producer_scope_orders(request.user, date_from, date_to)
+        date_from = request.GET.get("date_from")
+        date_to = request.GET.get("date_to")
 
-        roll = defaultdict(lambda: {"orders": 0, "revenue": 0.0, "success": 0, "total": 0, "aov_sum": 0.0, "rating_sum": 0.0, "rating_cnt": 0})
-        for o in orders.only("id", "total_price", "payment_method", "payment_status", "customer_rating"):
-            pm = getattr(o, "payment_method", None) or "unknown"
-            snap_addr = getattr(o, "shipping_address_snapshot", None) or {}
-            region = snap_addr.get("region") or snap_addr.get("department") or "unknown"
-            key = (pm, region)
-            r = roll[key]
-            r["orders"] += 1
-            r["revenue"] += _safe_float(o.total_price)
-            r["aov_sum"] += _safe_float(o.total_price)
-            r["total"] += 1
-            if getattr(o, "payment_status", "") in ("paid", "succeeded", "success"):
-                r["success"] += 1
-            if o.customer_rating is not None:
-                r["rating_sum"] += float(o.customer_rating)
-                r["rating_cnt"] += 1
+        qs = self.get_orders(request, date_from, date_to).select_related("payment_method").only(
+            "id",
+            "total_price",
+            "status",
+            "payment_method",
+            "payment_method_snapshot",
+            "customer_rating",
+            "shipping_address_snapshot",
+            "created_at",
+        )
+
+        # prefetch items for producer/company extraction
+        prefetch_items = Prefetch(
+            "items",
+            queryset=OrderItem.objects.only("id", "bundle_id", "bundle_snapshot")
+        )
+        qs = qs.prefetch_related(prefetch_items)
+
+        agg = defaultdict(lambda: {"orders": 0, "revenue": Decimal("0.0"), "success": 0, "label": "unknown"})
+        order_rows = []
+
+        def _pm_label(order):
+            pm = getattr(order, "payment_method", None)
+            if pm:
+                return (
+                    getattr(pm, "code", None)
+                    or getattr(pm, "name", None)
+                    or getattr(pm, "provider_name", None)
+                    or str(pm)
+                )
+            snap = getattr(order, "payment_method_snapshot", None)
+            if isinstance(snap, dict):
+                t = (snap.get("type") or "unknown")
+                p = (snap.get("provider") or snap.get("provider_name") or "unknown")
+                return f"{t}:{p}"
+            return "unknown"
+
+        def _is_success(order):
+            st = str(getattr(order, "status", "") or "").lower()
+            if st in ("confirmed", "delivered"):
+                return True
+            payments_rel = getattr(order, "payments", None) or getattr(order, "payment_set", None)
+            if payments_rel is not None:
+                iterable = payments_rel.all() if hasattr(payments_rel, "all") else payments_rel
+                for pay in iterable:
+                    pst = str(getattr(pay, "status", "") or "").lower()
+                    if pst in ("paid", "succeeded", "success", "captured", "completed"):
+                        return True
+            return False
+
+        for o in qs:
+            pm_key = _pm_label(o)
+            price = Decimal(str(getattr(o, "total_price", 0) or 0))
+            success = _is_success(o)
+
+            rec = agg[pm_key]
+            rec["orders"] += 1
+            rec["revenue"] += price
+            if success:
+                rec["success"] += 1
+            rec["label"] = pm_key
+
+            # collect producer/company names from order items' snapshots
+            pnames = set()
+            cnames = set()
+            items_rel = getattr(o, "items", None)
+            iterable = items_rel.all() if hasattr(items_rel, "all") else (items_rel or [])
+            for it in iterable:
+                snap = getattr(it, "bundle_snapshot", None) or {}
+                # producer display names (owners)
+                for nm in (_bundle_producer_names(getattr(it, "bundle_id", None), snap) or []):
+                    if nm:
+                        pnames.add(nm)
+                # company names
+                for (_cid, nm) in (_extract_snapshot_companies(snap) or []):
+                    if nm:
+                        cnames.add(nm)
+
+            order_rows.append({
+                "order_id": o.id,
+                "item_id": None,
+                "payment_method": pm_key,
+                "amount": float(price),
+                "producer_names": sorted(pnames) if pnames else [],
+                "company_names": sorted(cnames) if cnames else [],
+            })
 
         rows = []
-        for (pm, region), v in roll.items():
+        for key, v in agg.items():
+            n = v["orders"] or 1
             rows.append({
-                "payment_method": pm,
-                "region": region,
-                "orders": v["orders"],
-                "revenue": round(v["revenue"], 2),
-                "success_rate": round((v["success"] / v["total"]) if v["total"] else 0.0, 4),
-                "avg_order_value": round((v["aov_sum"] / v["orders"]) if v["orders"] else 0.0, 2),
-                "avg_rating": round((v["rating_sum"] / v["rating_cnt"]) if v["rating_cnt"] else 0.0, 2),
+                "payment_method": v["label"],
+                "aov": float(v["revenue"] / n),
+                "success_rate": float(v["success"] / n),
             })
-        rows.sort(key=lambda r: (-r["revenue"], -r["orders"]))
-        return Response({"rows": rows})
 
+        rows.sort(key=lambda r: (-r["aov"], r["payment_method"]))
+        return Response({"rows": rows, "order_rows": order_rows})
+    
 
 # =====================================================================
 # 5) Performance géo : Revenus × Note × Impact — UNIFIÉ
